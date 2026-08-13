@@ -54,9 +54,8 @@ void Dx12StateWriter::WriteState(const Dx12StateTable& state_table,
 void Dx12StateWriter::WriteState(const Dx12StateTable& state_table, uint64_t frame_number)
 #endif // GFXRECON_AGS_SUPPORT
 {
-#if GFXRECON_DEBUG_WRITTEN_OBJECTS
     written_objects_.clear();
-#endif
+    creating_objects_.clear();
 
     format::Marker marker;
     marker.header.size  = sizeof(marker.marker_type) + sizeof(marker.frame_number);
@@ -76,17 +75,14 @@ void Dx12StateWriter::WriteState(const Dx12StateTable& state_table, uint64_t fra
     StandardCreateWrite<ID3D12DeviceRemovedExtendedDataSettings_Wrapper>(state_table);
 
     // DXGI objects
-    StandardCreateWrite<IDXGIFactory_Wrapper>(state_table);
-    StandardCreateWrite<IDXGISurface_Wrapper>(state_table);
+    // Root factories have no dependency and are written first. Factories obtained via IDXGIObject::GetParent are
+    // deferred until after swap chains, because their source can be either an adapter or a swap chain.
+    WriteDxgiFactoryState(state_table, false);
     StandardCreateWrite<IDXGIFactoryMedia_Wrapper>(state_table);
-    StandardCreateWrite<IDXGIDecodeSwapChain_Wrapper>(state_table);
     StandardCreateWrite<IDXGIAdapter_Wrapper>(state_table);
     StandardCreateWrite<IDXGIDevice_Wrapper>(state_table);
     StandardCreateWrite<IDXGIDisplayControl_Wrapper>(state_table);
-    StandardCreateWrite<IDXGIKeyedMutex_Wrapper>(state_table);
-    StandardCreateWrite<IDXGIOutput_Wrapper>(state_table);
-    StandardCreateWrite<IDXGIOutputDuplication_Wrapper>(state_table);
-    StandardCreateWrite<IDXGIResource_Wrapper>(state_table);
+    WriteDxgiOutputState(state_table, false);
 
 #ifdef GFXRECON_AGS_SUPPORT
     // AGS calls
@@ -94,7 +90,7 @@ void Dx12StateWriter::WriteState(const Dx12StateTable& state_table, uint64_t fra
     WriteAgsDriverExtensionsDX12CreateDevice(ags_state_table);
 #endif // GFXRECON_AGS_SUPPORT
 
-    // Agility SDK constructs
+    // Agility SDK constructs.
     StandardCreateWrite<ID3D12SDKConfiguration_Wrapper>(state_table);
     StandardCreateWrite<ID3D12DeviceFactory_Wrapper>(state_table);
 
@@ -117,6 +113,12 @@ void Dx12StateWriter::WriteState(const Dx12StateTable& state_table, uint64_t fra
     StandardCreateWrite<IDXGISwapChainMedia_Wrapper>(state_table);
     StandardCreateWrite<ID3D12SwapChainAssistant_Wrapper>(state_table);
 
+    WriteDxgiFactoryState(state_table, true);
+
+    WriteDxgiOutputState(state_table, true);
+
+    StandardCreateWrite<IDXGIOutputDuplication_Wrapper>(state_table);
+
     // Fences
     WriteFenceState(state_table);
 
@@ -138,6 +140,12 @@ void Dx12StateWriter::WriteState(const Dx12StateTable& state_table, uint64_t fra
     std::unordered_map<format::HandleId, uint64_t>                          max_resource_sizes;
     WriteResourceCreationState(state_table, resource_snapshots, max_resource_sizes);
     WriteDescriptorState(state_table);
+
+    StandardCreateWrite<IDXGIResource_Wrapper>(state_table);
+    StandardCreateWrite<IDXGISurface_Wrapper>(state_table);
+    StandardCreateWrite<IDXGIKeyedMutex_Wrapper>(state_table);
+
+    StandardCreateWrite<IDXGIDecodeSwapChain_Wrapper>(state_table);
 
     // The resource snapshots must be written after the descriptors in order to support resource value mapping for
     // optimized DXR replay.
@@ -185,40 +193,83 @@ void Dx12StateWriter::WriteState(const Dx12StateTable& state_table, uint64_t fra
     output_stream_->Write(&marker, sizeof(marker));
 }
 
-void Dx12StateWriter::StandardCreateWrite(format::HandleId object_id, const DxWrapperInfo& wrapper_info)
+bool Dx12StateWriter::StandardCreateWrite(format::HandleId object_id, const DxWrapperInfo& wrapper_info)
 {
-#if GFXRECON_DEBUG_WRITTEN_OBJECTS
-    // Check that each object is created only once.
-    assert(written_objects_.find(object_id) == written_objects_.end());
-#endif
+    if (written_objects_.find(object_id) != written_objects_.end())
+    {
+        return true;
+    }
+
+    // A create_object_id cycle indicates corrupt capture state; abort recursion to prevent unbounded dependency repair.
+    if (creating_objects_.find(object_id) != creating_objects_.end())
+    {
+        GFXRECON_LOG_ERROR("Dx12StateWriter: cyclic create dependency detected for object %" PRIu64
+                           " (create call %u, parent object %" PRIu64
+                           "). The object is omitted from the trimmed state; replay of the trimmed capture may be "
+                           "affected.",
+                           object_id,
+                           static_cast<uint32_t>(wrapper_info.create_call_id),
+                           wrapper_info.create_object_id);
+        return false;
+    }
+    creating_objects_.insert(object_id);
+
+    bool written = false;
 
     if (wrapper_info.create_object_id == format::kNullHandleId)
     {
         WriteFunctionCall(wrapper_info.create_call_id, wrapper_info.create_parameters.get());
-#if GFXRECON_DEBUG_WRITTEN_OBJECTS
         written_objects_.insert(object_id);
-#endif
+        written = true;
     }
     else
     {
-        bool create_temp_object_dependency = ((wrapper_info.create_object_info != nullptr) &&
-                                              (wrapper_info.create_object_info->GetWrapper() == nullptr));
-
-        // Write a create call for the parent object if its wrapper has been destroyed.
-        if (create_temp_object_dependency)
+        bool release_temp_parent = false;
+        if (written_objects_.find(wrapper_info.create_object_id) == written_objects_.end())
         {
-            StandardCreateWrite(wrapper_info.create_object_id, *wrapper_info.create_object_info.get());
+            bool parent_written = false;
+
+            if (wrapper_info.create_object_info != nullptr)
+            {
+                const bool parent_destroyed = (wrapper_info.create_object_info->GetWrapper() == nullptr);
+
+                parent_written =
+                    StandardCreateWrite(wrapper_info.create_object_id, *wrapper_info.create_object_info.get());
+
+                if (parent_written)
+                {
+                    release_temp_parent = parent_destroyed;
+
+                    if (!parent_destroyed)
+                    {
+                        GFXRECON_LOG_WARNING("Dx12StateWriter: object %" PRIu64
+                                             " (create call %u) is written before its parent %" PRIu64
+                                             "; writing the parent early.",
+                                             object_id,
+                                             static_cast<uint32_t>(wrapper_info.create_call_id),
+                                             wrapper_info.create_object_id);
+                    }
+                }
+            }
+
+            if (!parent_written)
+            {
+                GFXRECON_LOG_ERROR("Dx12StateWriter: cannot write creation of object %" PRIu64
+                                   " (create call %u): its parent object %" PRIu64
+                                   " has not been written. The object is omitted from the trimmed state; replay of "
+                                   "the trimmed capture may be affected.",
+                                   object_id,
+                                   static_cast<uint32_t>(wrapper_info.create_call_id),
+                                   wrapper_info.create_object_id);
+                creating_objects_.erase(object_id);
+                return false;
+            }
         }
 
-#if GFXRECON_DEBUG_WRITTEN_OBJECTS
-        // Check that the parent object has been created.
-        assert(written_objects_.find(wrapper_info.create_object_id) != written_objects_.end());
-#endif
         WriteMethodCall(
             wrapper_info.create_call_id, wrapper_info.create_object_id, wrapper_info.create_parameters.get());
-#if GFXRECON_DEBUG_WRITTEN_OBJECTS
         written_objects_.insert(object_id);
-#endif
+        written = true;
 
         if (wrapper_info.object_name.empty() == false)
         {
@@ -226,11 +277,14 @@ void Dx12StateWriter::StandardCreateWrite(format::HandleId object_id, const DxWr
         }
 
         // Release any temporarily created parent object.
-        if (create_temp_object_dependency)
+        if (release_temp_parent)
         {
             WriteReleaseCommand(wrapper_info.create_object_id, 0);
         }
     }
+
+    creating_objects_.erase(object_id);
+    return written;
 }
 
 void Dx12StateWriter::WriteFunctionCall(format::ApiCallId call_id, util::MemoryOutputStream* parameter_buffer)
@@ -645,13 +699,11 @@ void Dx12StateWriter::WriteReleaseCommand(format::HandleId handle_id, unsigned l
     WriteMethodCall(format::ApiCallId::ApiCall_IUnknown_Release, handle_id, &parameter_stream_);
     parameter_stream_.Clear();
 
-#if GFXRECON_DEBUG_WRITTEN_OBJECTS
     if (result_ref_count == 0)
     {
         // If this object is needed again, it will need to be re-created in the capture file.
         written_objects_.erase(handle_id);
     }
-#endif
 }
 
 void Dx12StateWriter::WriteResourceCreationState(
@@ -1331,7 +1383,8 @@ void Dx12StateWriter::WriteCommandListCreation(const ID3D12CommandList_Wrapper* 
             " but has since been released. The command allocator will be freed after the command list creation.",
             list_info->create_command_allocator_id,
             list_wrapper->GetCaptureId());
-        StandardCreateWrite(list_info->create_command_allocator_id, *list_info->create_command_allocator_info.get());
+        create_temp_command_allocator = StandardCreateWrite(list_info->create_command_allocator_id,
+                                                            *list_info->create_command_allocator_info.get());
     }
 
     // Write call to create the command list.
@@ -1479,6 +1532,64 @@ bool Dx12StateWriter::CheckResourceObject(const ID3D12ResourceInfo* resource_inf
         default:
             return true;
     }
+}
+
+void Dx12StateWriter::WriteDxgiFactoryState(const Dx12StateTable& state_table, bool get_parent_derived)
+{
+    std::set<util::MemoryOutputStream*> processed;
+    state_table.VisitWrappers([&](const IDXGIFactory_Wrapper* wrapper) {
+        GFXRECON_ASSERT(wrapper != nullptr);
+        GFXRECON_ASSERT(wrapper->GetObjectInfo() != nullptr);
+        GFXRECON_ASSERT(wrapper->GetObjectInfo()->create_parameters != nullptr);
+
+        auto wrapper_info = wrapper->GetObjectInfo();
+
+        // A factory whose create call is GetParent is written in the deferred pass, after swap chains and any adapter
+        // from which it may have been retrieved.
+        const bool from_get_parent = (wrapper_info->create_call_id == format::ApiCallId::ApiCall_IDXGIObject_GetParent);
+        if (from_get_parent != get_parent_derived)
+        {
+            return;
+        }
+
+        // Filter duplicate entries for calls that create multiple objects, where objects created by the same call
+        // all reference the same parameter buffer.
+        if (processed.find(wrapper_info->create_parameters.get()) == processed.end())
+        {
+            StandardCreateWrite(wrapper);
+            processed.insert(wrapper_info->create_parameters.get());
+        }
+    });
+}
+
+void Dx12StateWriter::WriteDxgiOutputState(const Dx12StateTable& state_table, bool from_swapchain)
+{
+    std::set<util::MemoryOutputStream*> processed;
+    state_table.VisitWrappers([&](const IDXGIOutput_Wrapper* wrapper) {
+        GFXRECON_ASSERT(wrapper != nullptr);
+        GFXRECON_ASSERT(wrapper->GetObjectInfo() != nullptr);
+        GFXRECON_ASSERT(wrapper->GetObjectInfo()->create_parameters != nullptr);
+
+        auto wrapper_info = wrapper->GetObjectInfo();
+
+        const bool from_swapchain_object =
+            (wrapper_info->create_object_id != format::kNullHandleId) &&
+            (state_table.GetIDXGISwapChain_Wrapper(wrapper_info->create_object_id) != nullptr);
+        const bool from_swapchain_call =
+            (wrapper_info->create_call_id == format::ApiCallId::ApiCall_IDXGISwapChain_GetContainingOutput) ||
+            (wrapper_info->create_call_id == format::ApiCallId::ApiCall_IDXGISwapChain_GetFullscreenState) ||
+            (wrapper_info->create_call_id == format::ApiCallId::ApiCall_IDXGISwapChain1_GetRestrictToOutput);
+        if ((from_swapchain_object || from_swapchain_call) != from_swapchain)
+        {
+            return;
+        }
+
+        if (processed.find(wrapper_info->create_parameters.get()) == processed.end())
+        {
+            StandardCreateWrite(wrapper);
+            processed.insert(wrapper_info->create_parameters.get());
+        }
+    });
 }
 
 void Dx12StateWriter::WriteSwapChainState(const Dx12StateTable& state_table)

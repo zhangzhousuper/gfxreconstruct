@@ -38,12 +38,7 @@
 #include "util/memory_output_stream.h"
 #include "generated/generated_dx12_state_table.h"
 
-// TODO: Is the debug code enabled by this define still useful?
-#define GFXRECON_DEBUG_WRITTEN_OBJECTS 1
-
-#if GFXRECON_DEBUG_WRITTEN_OBJECTS
 #include <unordered_set>
-#endif
 
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
 GFXRECON_BEGIN_NAMESPACE(encode)
@@ -99,13 +94,15 @@ class Dx12StateWriter
         assert(wrapper->GetObjectInfo()->create_parameters != nullptr);
 
         auto wrapper_info = wrapper->GetObjectInfo();
-        StandardCreateWrite(wrapper->GetCaptureId(), *wrapper_info.get());
-        WriteAddRefAndReleaseCommands(wrapper);
-        WritePrivateData(wrapper->GetCaptureId(), *wrapper_info.get());
-        WritePrivateDataInterface(wrapper->GetCaptureId(), *wrapper_info.get());
+        if (StandardCreateWrite(wrapper->GetCaptureId(), *wrapper_info.get()))
+        {
+            WriteAddRefAndReleaseCommands(wrapper);
+            WritePrivateData(wrapper->GetCaptureId(), *wrapper_info.get());
+            WritePrivateDataInterface(wrapper->GetCaptureId(), *wrapper_info.get());
+        }
     }
 
-    void StandardCreateWrite(format::HandleId object_id, const DxWrapperInfo& wrapper_info);
+    bool StandardCreateWrite(format::HandleId object_id, const DxWrapperInfo& wrapper_info);
 
     // TODO: These are similar to the functions used by CaptureManager to write call data. They could be refactored for
     // code reuse.
@@ -189,6 +186,13 @@ class Dx12StateWriter
 
     void WriteSwapChainState(const Dx12StateTable& state_table);
 
+    // Writes IDXGIFactory creations as one of two ordered passes. Root factories created via CreateDXGIFactory* have
+    // no object dependency and are emitted before adapters. Factories obtained via IDXGIObject::GetParent can depend
+    // on an adapter or a swap chain, so they are emitted after swap chain state. get_parent_derived selects the pass.
+    void WriteDxgiFactoryState(const Dx12StateTable& state_table, bool get_parent_derived);
+
+    void WriteDxgiOutputState(const Dx12StateTable& state_table, bool from_swapchain);
+
     void WriteEnableDebugLayer();
 
     void WriteEnableDRED();
@@ -222,10 +226,11 @@ class Dx12StateWriter
     ParameterEncoder         encoder_;
     graphics::Dx12GpuVaMap   gpu_va_map_;
 
-#if GFXRECON_DEBUG_WRITTEN_OBJECTS
-    // Track the list of objects that have been written in WriteState.
+    // Track the objects that have been written in WriteState.
     std::unordered_set<format::HandleId> written_objects_;
-#endif
+
+    // Detects corrupt create_object_id cycles before dependency repair recurses indefinitely.
+    std::unordered_set<format::HandleId> creating_objects_;
 
     // Temporary vectors.
     std::vector<uint8_t>           temp_subresource_data_;
